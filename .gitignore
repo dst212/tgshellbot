@@ -1,0 +1,8 @@
+**/__pycache__
+*.session
+*.session-journal
+config.py
+keys.py
+env
+Session.vim
+trash
