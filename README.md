@@ -54,4 +54,10 @@ Used libraries:
 
 - [`pyrogram`](https://pyrogram.org/): Telegram client
 
-# 
+## Known issues
+
+- When the output exceeds the maximum allowed length (3840 characters):
+  
+  - newly created messages won't send any input when replied to;
+  
+  - the output will be split exactly at the 3840th character, it's planned to make it split in the last '\n' available, the position of which may vary.
