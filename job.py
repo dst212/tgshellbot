@@ -25,12 +25,15 @@ class Job:
     _short: str = None
     _header: str = None
     _markup: InlineKeyboardMarkup = None
+    _time: float = None
 
     def __init__(self, command: str, from_user: User, message: Message):
         self._command = command
         self._from_user = from_user
         self._top_message = message
         self._message = message
+        self._olock = asyncio.Lock()
+        self._elock = asyncio.Lock()
         self._buf_lock = asyncio.Lock()
 
     @property
@@ -106,56 +109,69 @@ class Job:
         async with self._buf_lock:
             self._buf += buf
 
-    # Refresh the output message
-    async def flush(self):
+    # Edit and ignore MessageNotModified
+    async def _edit(self, *args, **kwargs):
         try:
-            async with self._buf_lock:
-                # Handle max length (4096 bytes)
-                while len(self._buf) > MAX_LENGTH:
-                    await try_wait(
-                        self._message.edit,
-                        f"{self.header}\n\n"
-                        "Output:\n<pre language=\"log\">"
-                        f"{html.escape(self._buf[:MAX_LENGTH].decode())}%</pre>\n"
-                    )
-                    self._buf = b'%' + self._buf[MAX_LENGTH:]
-                    self._message = await try_wait(self._message.reply, "Loading...", quote=True)
-                # Update the output message
-                await try_wait(
-                    self._message.edit,
-                    f"{self.header}\n\n"
-                    f"Output:\n<pre language=\"log\">{html.escape(self._buf.decode() or '%')}</pre>\n" +
-                    ("Running..." if self.running else "Exited."),
-                    reply_markup=self.markup if self.running else None,
-                )
+            await self._message.edit(*args, **kwargs)
         except MessageNotModified:
             pass
 
+    # Refresh the output message
+    async def flush(self):
+        async with self._buf_lock:
+            # Handle max length (4096 bytes)
+            while len(self._buf) > MAX_LENGTH:
+                await try_wait(
+                    self._edit,
+                    f"{self.header}\n\n"
+                    "Output:\n<pre language=\"log\">"
+                    f"{html.escape(self._buf[:MAX_LENGTH].decode())}%</pre>\n"
+                )
+                self._buf = b"%" + self._buf[MAX_LENGTH:]
+                self._message = await try_wait(self._message.reply, "Loading...", quote=True)
+            # Update the output message
+            await try_wait(
+                self._edit,
+                f"{self.header}\n\n"
+                f"Output:\n<pre language=\"log\">{html.escape(self._buf.decode() or '%')}</pre>\n" +
+                ("Running..." if self._time is None else
+                 f"Exited with code <code>{self._proc.returncode}</code> in {self._time}s."),
+                reply_markup=self.markup if self.running else None,
+            )
+
     # Thread's target to log stdout and update the Telegram message
     async def _log(self):
-        while True:
-            buf = await self._proc.stdout.readline()
-            if not buf:
-                break
-            await self.buf_append(buf)
-            try:
-                await self.flush()
-            except Exception:
-                log.error(f"Error while flushing {self.name}/stdout ({self.command}):")
-                traceback.print_exc()
+        async with self._olock:
+            while True:
+                buf = await self._proc.stdout.readline()
+                if not buf:
+                    break
+                await self.buf_append(buf)
+                if self.running:
+                    # The buffer is flushed only when the program is running, otherwise it's run()'s task.
+                    # I could read all bytes above here and flush all at once, but then stdout and stderr
+                    # would print their statements in different order, so I'll keep the readline() method
+                    # and buf_append() for each line from both stdout and stderr
+                    try:
+                        await self.flush()
+                    except Exception:
+                        log.error(f"Error while flushing {self.name}/stdout ({self.command}):")
+                        traceback.print_exc()
 
     # Same as _log() but with stderr
     async def _logerr(self):
-        while True:
-            buf = await self._proc.stderr.readline()
-            if not buf:
-                break
-            await self.buf_append(buf)
-            try:
-                await self.flush()
-            except Exception:
-                log.error(f"Error while flushing {self.name}/stderr ({self.command}):")
-                traceback.print_exc()
+        async with self._elock:
+            while True:
+                buf = await self._proc.stderr.readline()
+                if not buf:
+                    break
+                await self.buf_append(buf)
+                if self.running:
+                    try:
+                        await self.flush()
+                    except Exception:
+                        log.error(f"Error while flushing {self.name}/stderr ({self.command}):")
+                        traceback.print_exc()
 
     # Run the command
     async def run(self):
@@ -176,14 +192,19 @@ class Job:
         asyncio.run_coroutine_threadsafe(self._logerr(), loop)
         await self._proc.wait()
 
-        delta = time.time() - start
+        self._time = round((time.time() - start) * 1000)/1000
         log.info(f"×[{self.pid}] {self.short_command} ({self._proc.returncode})")
-        # Remove buttons
-        await self.flush()
+        # Flush at once what's left
+        await self._elock.acquire()
+        await self._olock.acquire()
+        try:
+            await self.flush()
+        finally:
+            self._elock.release()
+            self._olock.release()
         # Let's put this here to notify users when a process stops
-        # instead of appending it to the original message
         await self._message.reply(
             f"Process exited with code <code>{self._proc.returncode}</code>.\n"
-            f"Execution time: {round((delta) * 1000)/1000}s.",
+            f"Execution time: {self._time}s.",
             quote=True,
         )
