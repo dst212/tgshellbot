@@ -32,8 +32,6 @@ class Job:
         self._from_user = from_user
         self._top_message = message
         self._message = message
-        self._olock = asyncio.Lock()
-        self._elock = asyncio.Lock()
         self._buf_lock = asyncio.Lock()
 
     @property
@@ -135,49 +133,41 @@ class Job:
                 f"{self.header}\n\n"
                 f"Output:\n<pre language=\"log\">{html.escape(self._buf.decode() or '%')}</pre>\n" +
                 ("Running..." if self._time is None else
-                 f"Exited with code <code>{self._proc.returncode}</code> in {self._time}s."),
+                 f"Exited with code <code>{self._proc.returncode}</code> in {self._time:.3f}s."),
                 reply_markup=self.markup if self.running else None,
             )
 
-    # Thread's target to log stdout and update the Telegram message
-    async def _log(self):
-        async with self._olock:
-            while True:
-                buf = await self._proc.stdout.readline()
-                if not buf:
-                    break
-                await self.buf_append(buf)
-                if self.running:
-                    # The buffer is flushed only when the program is running, otherwise it's run()'s task.
-                    # I could read all bytes above here and flush all at once, but then stdout and stderr
-                    # would print their statements in different order, so I'll keep the readline() method
-                    # and buf_append() for each line from both stdout and stderr
-                    try:
-                        await self.flush()
-                    except Exception:
-                        log.error(f"Error while flushing {self.name}/stdout ({self.command}):")
-                        traceback.print_exc()
+    # Return the stream name given the stream object
+    async def stream_name(self, stream):
+        return (
+            "stdout" if stream is self._proc.stdout else
+            "stderr" if stream is self._proc.stderr else
+            "unknown"
+        )
 
-    # Same as _log() but with stderr
-    async def _logerr(self):
-        async with self._elock:
-            while True:
-                buf = await self._proc.stderr.readline()
-                if not buf:
-                    break
-                await self.buf_append(buf)
-                if self.running:
-                    try:
-                        await self.flush()
-                    except Exception:
-                        log.error(f"Error while flushing {self.name}/stderr ({self.command}):")
-                        traceback.print_exc()
+    # Thread's target to log stdout and update the Telegram message
+    async def _log(self, stream):
+        while True:
+            buf = await stream.readline()
+            if not buf:
+                break
+            await self.buf_append(buf)
+            if self.running:
+                # The buffer is flushed only when the program is running, otherwise it's run()'s task.
+                # I could read all bytes above here and flush all at once, but then stdout and stderr
+                # would print their statements in different order, so I'll keep the readline() method
+                # and buf_append() for each line from both stdout and stderr
+                try:
+                    await self.flush()
+                except Exception:
+                    log.error(f"Error while flushing {self.name}/{self.stream_name(stream)} ({self.command}):")
+                    traceback.print_exc()
 
     # Run the command
     async def run(self):
         loop = asyncio.get_event_loop()
         start = time.time()
-        self._proc = await asyncio.create_subprocess_shell(
+        proc = self._proc = await asyncio.create_subprocess_shell(
             self._command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -188,23 +178,21 @@ class Job:
         # Update output message with PID and buttons
         asyncio.run_coroutine_threadsafe(self.flush(), loop)
         # Start logging stdout and stderr
-        asyncio.run_coroutine_threadsafe(self._log(), loop)
-        asyncio.run_coroutine_threadsafe(self._logerr(), loop)
+        fut_out = asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self._log(proc.stdout), loop))
+        fut_err = asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self._log(proc.stderr), loop))
         await self._proc.wait()
 
-        self._time = round((time.time() - start) * 1000)/1000
+        self._time = time.time() - start  # round(() * 1000)/1000
         log.info(f"×[{self.pid}] {self.short_command} ({self._proc.returncode})")
         # Flush at once what's left
-        await self._elock.acquire()
-        await self._olock.acquire()
-        try:
-            await self.flush()
-        finally:
-            self._elock.release()
-            self._olock.release()
+        await fut_out
+        await fut_err
+        await self.flush()
         # Let's put this here to notify users when a process stops
         await self._message.reply(
             f"Process exited with code <code>{self._proc.returncode}</code>.\n"
-            f"Execution time: {self._time}s.",
+            f"Execution time: {self._time:.3f}s.",
             quote=True,
         )
